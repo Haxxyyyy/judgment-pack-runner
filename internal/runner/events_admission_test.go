@@ -305,8 +305,8 @@ func TestSubmitRunIdempotencyKeyVisibleASCIIBoundaries(t *testing.T) {
 		{"empty", "", 400},
 		{"129 characters", strings.Repeat("k", 129), 400},
 		{"space", "a b", 400},
-		{"control character", "a\\x01b", 400},
-		{"DEL", "a\\x7fb", 400},
+		{"control character", "a\x01b", 400},
+		{"DEL", "a\x7fb", 400},
 		{"non-ASCII letter", "é", 400},
 	}
 
