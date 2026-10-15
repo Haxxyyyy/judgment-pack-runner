@@ -43,6 +43,18 @@ type SourceInput struct {
 	Mapping       InputMapping           `json:"mapping"`
 	Snapshot      json.RawMessage        `json:"snapshot,omitempty"`
 	MappingDigest string                 `json:"mappingDigest,omitempty"`
+	// Import is a published dialect of version 3 and the binding document
+	// that binds its unbound sources to this installation's input profiles
+	// (dialect_v3.go). Mapping is the bound dialect they make, and the
+	// documents are kept beside it as given, the operator's record of what
+	// was bound: no preparation holds them or their digests.
+	Import *DialectImport `json:"import,omitempty"`
+	// mappingGiven is whether the request this source was decoded from
+	// names a mapping member, whatever its value, {} and null included
+	// (decodeInput). Beside an import, a mapping given must be the bound
+	// dialect, and only one the request does not name is made from it
+	// (importedSource).
+	mappingGiven bool
 }
 type sourceSnapshot struct {
 	Version    int    `json:"version"`
@@ -247,7 +259,7 @@ func pointerRead(v any, parts []string) (any, bool) {
 	return v, true
 }
 func (m InputMapping) validate() error {
-	if m.Version == 2 {
+	if m.dialect() {
 		return validateMappingV2(m)
 	}
 	if m.Case != nil || m.Sources != nil || m.Admits != nil || m.Unmapped != nil || m.UnmappedEvidence != nil {
@@ -284,7 +296,7 @@ func (m InputMapping) validate() error {
 	return nil
 }
 func mappingHash(m InputMapping) string {
-	if m.Version == 2 {
+	if m.dialect() {
 		return mappingV2Hash(m)
 	}
 	return digest(encode(m))
@@ -358,7 +370,7 @@ func readSourceDocument(c *SourceInput, requireRegistry bool) (any, sourceSnapsh
 	return data, s, r, nil
 }
 func normalizeInput(i Input) (Input, error) {
-	if i.Source != nil && (i.Source.Mapping.Version == 2 || len(i.Source.Case) > 0 || i.Source.Sources != nil) {
+	if i.Source != nil && (i.Source.Mapping.dialect() || i.Source.Import != nil || len(i.Source.Case) > 0 || i.Source.Sources != nil) {
 		return i, inputProblem("Mapping v2 requires the trusted Runner service.")
 	}
 	if i.Preparation != nil {
