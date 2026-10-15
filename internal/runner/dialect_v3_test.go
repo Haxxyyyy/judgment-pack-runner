@@ -757,3 +757,50 @@ func TestAnImportedRunIsSignedWitnessedAndBound(t *testing.T) {
 	}
 	writeBoundFixture(t, os.Getenv("JPACK_V3_IMPORT_EXPORT_DIR"), bundle, stand.profile)
 }
+
+// The event route reads a version-3 document by the same rule as the other
+// routes: one under a member that is mapping but for case is refused
+// invalid_source_input with the message the other routes give, and the
+// document under mapping is read as before.
+func TestAVersion3DocumentOnTheEventRouteIsReadOnlyUnderItsExactNames(t *testing.T) {
+	input, p, _, _ := v2Fixture(t)
+	three := asVersion3(input)
+	written := encode(three.Source.Mapping)
+	at := []byte(`"mapping":` + string(written))
+	delivery := encode(EventDelivery{ID: "evt-1", OccurredAt: now(), Input: three})
+	if !bytes.Contains(delivery, at) {
+		t.Fatal("the delivery does not name the document at input.source.mapping:", string(delivery))
+	}
+	cased := bytes.Replace(delivery, at, []byte(`"Mapping":`+string(written)), 1)
+
+	w := newCoverWorld(t)
+	tr, key := w.eventTrigger("queue")
+	header := map[string]string{"X-Trigger-Token": key}
+	message := func(w *httptest.ResponseRecorder) (int, string, string) {
+		var body struct {
+			Error struct{ Code, Message string }
+		}
+		if e := json.Unmarshal(w.Body.Bytes(), &body); e != nil {
+			t.Fatal("not an error body:", w.Code, w.Body.String())
+		}
+		return w.Code, body.Error.Code, body.Error.Message
+	}
+	got := serve(t, w.s, "POST", "/v1/triggers/"+tr.ID+"/events", string(cased), header)
+	want := "Mapping v3: the request names the member Mapping, which is mapping but for case: a dialect of version 3 is read only at input.source.mapping, each member of the path named exactly so and none beside it named so but for case, so that the document Runner keeps is the one written"
+	if status, code, text := message(got); status != http.StatusUnprocessableEntity || code != "invalid_source_input" || text != want {
+		t.Fatal(got.Code, got.Body.String())
+	}
+	// The same document, as a preview request, is refused with the same message.
+	h := (&Service{cfg: Config{InputProfiles: []InputProfile{p}}}).Handler("test")
+	preview := postTo(h, "/v1/previews", []byte(`{"pack":"","input":`+string(bytes.Replace(encode(three), at, []byte(`"Mapping":`+string(written)), 1))+`}`))
+	_, _, previewText := message(preview)
+	if _, _, text := message(got); text != previewText {
+		t.Fatal("the preview route's refusal differs:", preview.Body.String())
+	}
+	// The control: the document under mapping passes the encoding rule and
+	// reaches the frozen-mapping check, which this fixture's release fails.
+	control := serve(t, w.s, "POST", "/v1/triggers/"+tr.ID+"/events", string(delivery), header)
+	if status, code, text := message(control); status != http.StatusUnprocessableEntity || code != "mapping_mismatch" || text != "Use the job's reviewed input mapping." {
+		t.Fatal("the lowercase document does not reach the frozen-mapping check:", control.Code, control.Body.String())
+	}
+}
