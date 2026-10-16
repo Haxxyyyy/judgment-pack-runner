@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"reflect"
 	"regexp"
 	"sort"
 	"strconv"
@@ -31,7 +32,49 @@ func strictJSON(raw []byte, dest any) error {
 	if d.Decode(new(any)) != io.EOF {
 		return errors.New("one JSON value required")
 	}
+	if foreignReadSources(reflect.ValueOf(dest)) {
+		return errors.New(`json: unknown field "sources"`)
+	}
 	return nil
+}
+
+// foreignReadSources says whether a value strictJSON decoded holds a source
+// of a kind other than research whose read names sources. A read's sources
+// are a research source's reconciliation (spec/dialect.md §6.4), and the
+// read of a source of another kind has no such member: one that names it is
+// refused at decoding, with the decoder's own sentence for a member it does
+// not know, as it always was. Every other refusal of the decoder, and its
+// sentence, is as it was.
+func foreignReadSources(v reflect.Value) bool {
+	switch v.Kind() {
+	case reflect.Pointer, reflect.Interface:
+		return !v.IsNil() && foreignReadSources(v.Elem())
+	case reflect.Struct:
+		if v.Type() == reflect.TypeOf(MappingSource{}) {
+			return v.FieldByName("Kind").String() != "research" && v.FieldByName("Read").FieldByName("Sources").Len() > 0
+		}
+		for i := 0; i < v.NumField(); i++ {
+			if foreignReadSources(v.Field(i)) {
+				return true
+			}
+		}
+	case reflect.Slice, reflect.Array:
+		if v.Type().Elem().Kind() == reflect.Uint8 {
+			return false
+		}
+		for i := 0; i < v.Len(); i++ {
+			if foreignReadSources(v.Index(i)) {
+				return true
+			}
+		}
+	case reflect.Map:
+		for it := v.MapRange(); it.Next(); {
+			if foreignReadSources(it.Value()) {
+				return true
+			}
+		}
+	}
+	return false
 }
 func proofCanon(raw []byte) ([]byte, error) {
 	if len(raw) > MaxBody {
@@ -269,6 +312,9 @@ func validateDialect(m InputMapping, open bool) error {
 	allEvidence := []EvidenceMapping{}
 	types := map[string]string{"runAt": "timestamp"}
 	prior := map[string]bool{}
+	// Each earlier research source's recipe, by its name, which a
+	// reconciliation read names (spec/dialect.md §6.4).
+	recipes := map[string]*researchRecipe{}
 	checkParams := func(ps map[string]Parameter, caseOnly bool, local map[string]string) error {
 		if len(ps) > 64 {
 			return errors.New("too many parameters")
@@ -311,20 +357,28 @@ func validateDialect(m InputMapping, open bool) error {
 		if e := sourceForm(m.Version, s, open); e != nil {
 			return fail(e.Error())
 		}
+		if len(s.Read.Sources) > 0 && !(m.Version == 3 && isResearch(s)) {
+			return fail(researchFail(codeMalformed, "source %s: a read names sources only as a research source's reconciliation of earlier research sources, in dialect version 3", s.Name).Error())
+		}
+		research := m.Version == 3 && isResearch(s)
 		verified := s.Kind == "operation" || s.Kind == "selected-file" && s.Provider == "google-drive"
-		if s.Kind != "operation" && s.Kind != "selected-file" || s.Kind == "operation" && s.Provider != "" || s.Kind == "selected-file" && s.Provider != "google-drive" && s.Provider != "local-file" {
+		if !research && (s.Kind != "operation" && s.Kind != "selected-file" || s.Kind == "operation" && s.Provider != "" || s.Kind == "selected-file" && s.Provider != "google-drive" && s.Provider != "local-file") {
 			return fail("unsupported source kind/provider")
 		}
-		if verified && unboundOperation(s) {
+		// A research source's form, its recipe's and its assignments', is
+		// readResearchRecipe's, once its parameters are read (below).
+		switch {
+		case research:
+		case verified && unboundOperation(s):
 			// Its form, and that it names no profile, are sourceForm's.
 			if s.MaxAge < 1 || s.MaxAge > 86400 || len(s.Arguments) == 0 {
 				return fail("an unbound operation requires arguments and maxAge 1..86400")
 			}
-		} else if verified {
+		case verified:
 			if s.Profile == "" || !validDigest(s.ProfileDigest) || s.MaxAge < 1 || s.MaxAge > 86400 || len(s.Arguments) == 0 {
 				return fail("verified sources require a pinned profile, arguments and maxAge 1..86400")
 			}
-		} else if s.Profile != "" || s.ProfileDigest != "" || s.MaxAge != 0 || len(s.Arguments) > 0 || len(s.Parameters) > 0 {
+		case s.Profile != "" || s.ProfileDigest != "" || s.MaxAge != 0 || len(s.Arguments) > 0 || len(s.Parameters) > 0:
 			return fail("local files cannot declare verification metadata or dependencies")
 		}
 		local := map[string]string{}
@@ -333,6 +387,14 @@ func validateDialect(m InputMapping, open bool) error {
 		}
 		for n, t := range types {
 			local[n] = t
+		}
+		var recipe *researchRecipe
+		if research {
+			r, e := readResearchRecipe(s, local, open)
+			if e != nil {
+				return fail(e.Error())
+			}
+			recipe = r
 		}
 		if verified {
 			v, e := readInputJSON(s.Arguments)
@@ -357,6 +419,12 @@ func validateDialect(m InputMapping, open bool) error {
 		f, ev, e := readTargets(s.Read)
 		if e != nil {
 			return fail(e.Error())
+		}
+		if recipe != nil {
+			if e := researchReadForm(s, recipe, recipes); e != nil {
+				return fail(e.Error())
+			}
+			recipes[s.Name] = recipe
 		}
 		if s.Read.Copy != nil && (f == nil || ev == nil) {
 			return fail("copy requires facts and evidence arrays")

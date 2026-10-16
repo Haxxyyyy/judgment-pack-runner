@@ -81,6 +81,9 @@ func validateProfileKeys(profiles []InputProfile) (map[string]ed25519.PublicKey,
 		if c := p.Calculator; c != nil && (p.Class != "record" || p.Shape != "mcp" || c.Name == "" || len(c.Name) > 256 || c.Version == "" || len(c.Version) > 256) {
 			return nil, errors.New("a calculator profile is a record MCP profile naming its calculator and version")
 		}
+		if e := researchDeclarationForm(p); e != nil {
+			return nil, e
+		}
 		identity := p.PublicKey + "\n" + p.Source + "\n" + p.Authority
 		if c, ok := identities[identity]; ok && c != p.Class {
 			return nil, errors.New("one trusted source cannot have conflicting output classes")
@@ -121,6 +124,17 @@ func profileFor(s MappingSource, profiles []InputProfile) (InputProfile, error) 
 // verifyAcquisition verifies a single retained v3 acquisition, not a sealed
 // session/store. Unknown signed fields remain covered by the signature.
 func verifyAcquisition(raw, args []byte, p InputProfile, public ed25519.PublicKey, at time.Time, maxAge int) (json.RawMessage, *Citation, error) {
+	return verifyReceipt(raw, args, p, public, at, maxAge, false)
+}
+
+// verifyReceipt is verifyAcquisition. With research, it holds a research
+// source's retained response, or its record's own receipt, to the
+// specification's §5.2 where an operation's acquisition is held otherwise,
+// as before: the receipt's adapter is the profile's adapter, as a whole
+// object, and its observation and serving times are each within the
+// source's maxAge before at and 30 seconds after it, with no rule between
+// the two (researchTimes).
+func verifyReceipt(raw, args []byte, p InputProfile, public ed25519.PublicKey, at time.Time, maxAge int, research bool) (json.RawMessage, *Citation, error) {
 	fail := func(s string) (json.RawMessage, *Citation, error) { return nil, nil, errors.New(s) }
 	var response struct {
 		Result  json.RawMessage `json:"result"`
@@ -237,6 +251,9 @@ func verifyAcquisition(raw, args []byte, p InputProfile, public ed25519.PublicKe
 	if a["endpoint"] != endpoint || adapter["name"] != p.Adapter.Name || adapter["version"] != p.Adapter.Version || adapter["digest"] != p.Adapter.Digest {
 		return fail("adapter or endpoint differs from the trusted profile")
 	}
+	if research && !sameJSON(encode(adapter), encode(p.Adapter)) {
+		return fail("adapter or endpoint differs from the trusted profile")
+	}
 	sig, _ := hex.DecodeString(str("signature"))
 	delete(r, "signature")
 	unsigned, e := proofCanon(encode(r))
@@ -262,13 +279,22 @@ func verifyAcquisition(raw, args []byte, p InputProfile, public ed25519.PublicKe
 	if !ok {
 		return fail("missing observation time")
 	}
+	if research {
+		if e := researchTimes(observed, str("servedAt"), at, maxAge); e != nil {
+			return nil, nil, e
+		}
+		return result, &Citation{str("sessionId"), int(index), hex.EncodeToString(sig)}, nil
+	}
 	obs, e := time.Parse(time.RFC3339Nano, observed)
 	if e != nil {
 		return fail("invalid observation time")
 	}
 	served, e := time.Parse(time.RFC3339Nano, str("servedAt"))
-	if e != nil || obs.After(served.Add(30*time.Second)) || served.After(at.Add(30*time.Second)) || obs.After(at.Add(30*time.Second)) || obs.Before(at.Add(-time.Duration(maxAge)*time.Second)) {
+	if e != nil {
 		return fail("acquisition is stale or from the future")
+	}
+	if obs.After(served.Add(30*time.Second)) || served.After(at.Add(30*time.Second)) || obs.After(at.Add(30*time.Second)) || obs.Before(at.Add(-time.Duration(maxAge)*time.Second)) {
+		return nil, nil, errAcquisitionStale
 	}
 	return result, &Citation{str("sessionId"), int(index), hex.EncodeToString(sig)}, nil
 }
