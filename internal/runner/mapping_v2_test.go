@@ -32,8 +32,13 @@ func canonTest(t *testing.T, raw []byte) []byte {
 	}
 	return b
 }
+
+// signResponse signs a response as the gateway does, its times written as
+// the gateway writes them: whole seconds in UTC (spec/dialect.md §1),
+// whatever the location of at.
 func signResponse(t *testing.T, p InputProfile, key ed25519.PrivateKey, args, result []byte, at time.Time, index int) json.RawMessage {
 	t.Helper()
+	at = at.UTC()
 	salt := bytes.Repeat([]byte{byte(index + 1)}, 32)
 	previous := any(nil)
 	if index > 0 {
@@ -502,4 +507,181 @@ func TestInputProfilesRefuseMalformedReceiptKeys(t *testing.T) {
 			}
 		})
 	}
+}
+
+// The operation receipt checks of spec/dialect.md §5.2 (runner #98), which
+// a research source's retained responses are held to alike (research.go).
+
+// resigned is the fixture's input with its vendor receipt changed and signed
+// again under the profile's key.
+func resigned(t *testing.T, input Input, key ed25519.PrivateKey, change func(receipt map[string]any)) Input {
+	t.Helper()
+	i := cloneInput(input)
+	v, _ := readInputJSON(i.Source.Sources["vendor"].Response)
+	r := v.(map[string]any)
+	receipt := r["receipt"].(map[string]any)
+	change(receipt)
+	signReceipt(t, receipt, key)
+	i.Source.Sources["vendor"] = SourceValue{Response: encode(r)}
+	return i
+}
+
+// preparedByEachCaller prepares an input as each caller of the preparation
+// does, as a version-2 document and as a version-3 one: a submission and
+// the preparation loop (normalizeV2), preflight (planning) and verify-run
+// (prepareV2, judging freshness). Each must answer alike; it returns that
+// answer.
+func preparedByEachCaller(t *testing.T, input Input, p InputProfile, at time.Time) error {
+	t.Helper()
+	var answers []string
+	var first error
+	for _, document := range []Input{input, asVersion3(input)} {
+		var judged []judgedFreshness
+		_, submitted := normalizeV2(cloneInput(document), []InputProfile{p}, at)
+		_, preflight := normalizeV2Mode(cloneInput(document), []InputProfile{p}, at, true)
+		_, verified := prepareV2(cloneInput(document), []InputProfile{p}, at, false, &judged)
+		if answers == nil {
+			first = submitted
+		}
+		answers = append(answers, fmt.Sprint(submitted), fmt.Sprint(preflight), fmt.Sprint(verified))
+	}
+	for _, a := range answers[1:] {
+		if a != answers[0] {
+			t.Fatalf("the callers of the preparation answer differently: %q", answers)
+		}
+	}
+	return first
+}
+
+// An operation's receipt times are each held to the window §5.2 gives,
+// against the preparation's instant (verifiedAt): no more than the source's
+// maxAge, 300 seconds here, before it and no more than 30 seconds after it,
+// the edges inside, for servedAt and acquisition.observedAt alike. A time
+// with no instant (§1: whole seconds in UTC, written with Z, a time that
+// exists) is invalid, not stale: a date that does not exist, a fraction of a
+// second, an offset in place of Z. No rule joins the two instants: an
+// observation 330 seconds after its service, each within the window, reads.
+func TestAnOperationReceiptsTimesAreEachWithinTheWindow(t *testing.T) {
+	const stale = "Source vendor: acquisition is stale or from the future. No decision was requested."
+	for _, member := range []string{"servedAt", "observedAt"} {
+		invalid := map[string]string{"servedAt": "Source vendor: invalid serving time. No decision was requested.", "observedAt": "Source vendor: invalid observation time. No decision was requested."}[member]
+		for name, c := range map[string]struct {
+			offset  time.Duration
+			instant string
+			want    string
+		}{
+			"at the lower edge":          {offset: -300 * time.Second},
+			"a second before the window": {offset: -301 * time.Second, want: stale},
+			"at the upper edge":          {offset: 30 * time.Second},
+			"a second after the window":  {offset: 31 * time.Second, want: stale},
+			"a time with no instant":     {instant: "2026-02-30T00:00:00Z", want: invalid},
+			"a fraction of a second":     {instant: ".5Z", want: invalid},
+			"an offset in place of Z":    {instant: "+00:00", want: invalid},
+		} {
+			t.Run(member+" "+name, func(t *testing.T) {
+				input, p, key, at := v2Fixture(t)
+				instant := c.instant
+				if instant == "" {
+					instant = at.Add(c.offset).Format(time.RFC3339)
+				} else if strings.HasPrefix(instant, ".") || strings.HasPrefix(instant, "+") {
+					// At the preparation's instant, inside the window: only
+					// its form refuses it.
+					instant = at.Format("2006-01-02T15:04:05") + instant
+				}
+				input = resigned(t, input, key, func(r map[string]any) {
+					if member == "servedAt" {
+						r["servedAt"] = instant
+					} else {
+						r["acquisition"].(map[string]any)["observedAt"] = instant
+					}
+				})
+				err := preparedByEachCaller(t, input, p, at)
+				if c.want == "" {
+					if err != nil {
+						t.Fatal(err)
+					}
+					return
+				}
+				refusedWith(t, err, c.want)
+			})
+		}
+	}
+	t.Run("an observation long after its service", func(t *testing.T) {
+		input, p, key, at := v2Fixture(t)
+		input = resigned(t, input, key, func(r map[string]any) {
+			r["servedAt"] = at.Add(-300 * time.Second).Format(time.RFC3339)
+			r["acquisition"].(map[string]any)["observedAt"] = at.Add(30 * time.Second).Format(time.RFC3339)
+		})
+		if err := preparedByEachCaller(t, input, p, at); err != nil {
+			t.Fatal("an observation after its service, both within the window, was refused:", err)
+		}
+	})
+}
+
+// An operation's receipt acquisition.adapter is its profile's adapter as a
+// whole object (§5.2, check 3): a signed receipt whose adapter has a member
+// more is refused as differing from the profile, and one with a member
+// fewer by its form.
+func TestAnOperationReceiptsAdapterIsItsProfilesWhole(t *testing.T) {
+	for name, c := range map[string]struct {
+		change func(adapter map[string]any)
+		want   string
+	}{
+		"a member more":  {func(a map[string]any) { a["extra"] = "not pinned" }, "Source vendor: adapter or endpoint differs from the trusted profile. No decision was requested."},
+		"a member fewer": {func(a map[string]any) { delete(a, "version") }, "Source vendor: invalid adapter. No decision was requested."},
+	} {
+		t.Run(name, func(t *testing.T) {
+			input, p, key, at := v2Fixture(t)
+			input = resigned(t, input, key, func(r map[string]any) {
+				c.change(r["acquisition"].(map[string]any)["adapter"].(map[string]any))
+			})
+			refusedWith(t, preparedByEachCaller(t, input, p, at), c.want)
+		})
+	}
+}
+
+// A selected Drive file's receipt is held to the same rule (§5.2): its
+// times are each a timestamp of whole seconds in UTC, so a fraction of a
+// second or an offset in place of Z, at the preparation's instant, is
+// invalid, for servedAt and acquisition.observedAt alike.
+func TestASelectedFilesReceiptTimesAreWholeSecondsInUTC(t *testing.T) {
+	input, p, _, at := driveFixture(t)
+	if err := preparedByEachCaller(t, input, p, at); err != nil {
+		t.Fatal(err)
+	}
+	for _, member := range []string{"servedAt", "observedAt"} {
+		want := map[string]string{"servedAt": "Source file: invalid serving time. No decision was requested.", "observedAt": "Source file: invalid observation time. No decision was requested."}[member]
+		for name, suffix := range map[string]string{"a fraction of a second": ".5Z", "an offset in place of Z": "+00:00"} {
+			t.Run(member+" "+name, func(t *testing.T) {
+				input, p, key, at := driveFixture(t)
+				instant := at.Format("2006-01-02T15:04:05") + suffix
+				input = resignedFile(t, input, key, func(r map[string]any) {
+					if member == "servedAt" {
+						r["servedAt"] = instant
+					} else {
+						r["acquisition"].(map[string]any)["observedAt"] = instant
+					}
+				})
+				refusedWith(t, preparedByEachCaller(t, input, p, at), want)
+			})
+		}
+	}
+}
+
+// resignedFile is a selected Drive file's input with the receipt its
+// snapshot's proof retains changed and signed again under key.
+func resignedFile(t *testing.T, input Input, key ed25519.PrivateKey, change func(receipt map[string]any)) Input {
+	t.Helper()
+	i := cloneInput(input)
+	v, _ := readInputJSON(i.Source.Sources["file"].Snapshot)
+	snap := v.(map[string]any)
+	proof := snap["proof"].(map[string]any)
+	v, _ = readInputJSON([]byte(proof["response"].(string)))
+	r := v.(map[string]any)
+	receipt := r["receipt"].(map[string]any)
+	change(receipt)
+	signReceipt(t, receipt, key)
+	proof["response"] = string(encode(r))
+	i.Source.Sources["file"] = SourceValue{Snapshot: encode(snap)}
+	return i
 }
